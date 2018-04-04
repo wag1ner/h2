@@ -4,10 +4,17 @@
 #include <math.h>
 #include <pthread.h>
 #include "common.h"
+#include <vector>
 
 //
 //  global variables
 //
+using namespace std;
+using std::vector;
+
+#define _cutoff 0.01
+#define _density 0.0005
+
 int n, n_threads,no_output=0;
 particle_t *particles;
 FILE *fsave,*fsum;
@@ -20,6 +27,26 @@ double gabsmin=1.0,gabsavg=0.0;
 //
 #define P( condition ) {if( (condition) != 0 ) { printf( "\n FAILURE in %s, line %d\n", __FILE__, __LINE__ );exit( 1 );}}
 
+
+double binSize,gridSize;
+int binNum;
+
+void buildBins(vector<bin_t>& bins, particle_t* particles, int n)
+{
+    gridSize = sqrt(n*_density);
+    binSize = _cutoff * 2;
+    binNum = int(gridSize / binSize)+1; // Should be around sqrt(N/2)
+    
+    bins.resize(binNum * binNum);
+    
+    for (int i = 0; i < n; i++)
+    {
+        int x = int(particles[i].x / binSize);
+        int y = int(particles[i].y / binSize);
+        bins[x*binNum + y].push_back(particles[i]);
+    }
+}
+
 //
 //  This is where the action happens
 //
@@ -28,7 +55,15 @@ void *thread_routine( void *pthread_id )
     int navg,nabsavg=0;
     double dmin,absmin=1.0,davg,absavg=0.0;
     int thread_id = *(int*)pthread_id;
-
+    
+    vector<bin_t> particle_bins;
+    bin_t temp;
+    
+    set_size( n );
+    init_particles( n, particles );
+    
+    buildBins(particle_bins, particles, n);
+    
     int particles_per_thread = (n + n_threads - 1) / n_threads;
     int first = min(  thread_id    * particles_per_thread, n );
     int last  = min( (thread_id+1) * particles_per_thread, n );
@@ -50,6 +85,30 @@ void *thread_routine( void *pthread_id )
             for (int j = 0; j < n; j++ )
                 apply_force( particles[i], particles[j], &dmin, &davg, &navg );
         }
+        for (int i = 0; i < binNum; i++)
+        {
+            for (int j = 0; j < binNum; j++)
+            {
+                bin_t& vec = particle_bins[i*binNum+j];
+                for (int k = 0; k < vec.size(); k++)
+                    vec[k].ax = vec[k].ay = 0;
+                for (int dx = -1; dx <= 1; dx++)   //Search over nearby 8 bins and itself
+                {
+                    for (int dy = -1; dy <= 1; dy++)
+                    {
+                        if (i + dx >= 0 && i + dx < binNum && j + dy >= 0 && j + dy < binNum)
+                        {
+                            bin_t& vec2 = particle_bins[(i+dx) * binNum + j + dy];
+                            for (int k = 0; k < vec.size(); k++)
+                                for (int l = 0; l < vec2.size(); l++)
+                                    apply_force( vec[k], vec2[l], &dmin, &davg, &navg);
+                        }
+                    }
+                }
+            }
+        }
+        
+        
         
         pthread_barrier_wait( &barrier );
         
@@ -70,6 +129,38 @@ void *thread_routine( void *pthread_id )
         //
         for( int i = first; i < last; i++ ) 
             move( particles[i] );
+        
+        for (int i = 0; i < binNum; i++)
+        {
+            for(int j = 0; j < binNum; j++)
+            {
+                bin_t& vec = particle_bins[i * binNum + j];
+                int tail = vec.size(), k = 0;
+                for(; k < tail; )
+                {
+                    move( vec[k] );
+                    int x = int(vec[k].x / binSize);  //Check the position
+                    int y = int(vec[k].y / binSize);
+                    if (x == i && y == j)  // Still inside original bin
+                        k++;
+                    else
+                    {
+                        temp.push_back(vec[k]);  // Store paricles that have changed bin.
+                        vec[k] = vec[--tail]; //Remove it from the current bin.
+                    }
+                }
+                vec.resize(k);
+            }
+        }
+        
+        for (int i = 0; i < temp.size(); i++)  // Put them into the new bin
+        {
+            int x = int(temp[i].x / binSize);
+            int y = int(temp[i].y / binSize);
+            particle_bins[x*binNum+y].push_back(temp[i]);
+        }
+        temp.clear();
+        
         
         pthread_barrier_wait( &barrier );
         
